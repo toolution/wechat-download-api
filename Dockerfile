@@ -51,7 +51,7 @@ EXPOSE 5000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:5000/api/health || exit 1
+    CMD curl -sf http://localhost:${PORT:-5000}/api/health || exit 1
 
-# Run with uvicorn
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000"]
+# Run with uvicorn（端口跟随 PORT 环境变量，兼容 Zeabur 等平台注入；为空则回落 5000）
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-5000}
