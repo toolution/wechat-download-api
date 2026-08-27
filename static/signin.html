@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - WeChat Download API</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f0f2f5;
+  }
+  .card {
+    width: 100%;
+    max-width: 360px;
+    margin: 16px;
+    padding: 40px 32px;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.08);
+  }
+  h1 { font-size: 20px; text-align: center; margin-bottom: 8px; color: #1a1a1a; }
+  .sub { font-size: 13px; text-align: center; color: #999; margin-bottom: 28px; }
+  label { display: block; font-size: 13px; color: #666; margin-bottom: 6px; }
+  input {
+    width: 100%;
+    padding: 10px 12px;
+    margin-bottom: 18px;
+    border: 1px solid #d9d9d9;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  input:focus { border-color: #07c160; }
+  button {
+    width: 100%;
+    padding: 11px;
+    border: none;
+    border-radius: 8px;
+    background: #07c160;
+    color: #fff;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background .2s;
+  }
+  button:hover { background: #06ad56; }
+  button:disabled { background: #95dfb6; cursor: not-allowed; }
+  .err {
+    display: none;
+    margin-bottom: 16px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    background: #fff1f0;
+    border: 1px solid #ffccc7;
+    color: #cf1322;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>WeChat Download API</h1>
+  <div class="sub">请登录后使用</div>
+  <div class="err" id="err"></div>
+  <form id="form">
+    <label for="username">账号</label>
+    <input id="username" autocomplete="username" required autofocus>
+    <label for="password">密码</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button type="submit" id="btn">登 录</button>
+  </form>
+</div>
+<script>
+  var form = document.getElementById('form');
+  var err = document.getElementById('err');
+  var btn = document.getElementById('btn');
+
+  // 只允许站内相对路径，防 open redirect
+  function safeNext() {
+    var next = new URLSearchParams(location.search).get('next') || '/';
+    return (next.charAt(0) === '/' && next.charAt(1) !== '/') ? next : '/';
+  }
+
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    err.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = '登录中…';
+    try {
+      var res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: document.getElementById('username').value,
+          password: document.getElementById('password').value
+        })
+      });
+      var data = await res.json().catch(function () { return {}; });
+      if (res.ok && data.ok) {
+        location.href = safeNext();
+      } else {
+        err.textContent = data.detail || '登录失败，请重试';
+        err.style.display = 'block';
+      }
+    } catch (e2) {
+      err.textContent = '网络错误，请重试';
+      err.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '登 录';
+    }
+  });
+</script>
+</body>
+</html>

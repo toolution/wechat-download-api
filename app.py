@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
@@ -188,6 +188,131 @@ if _ENABLE_MCP and _MCP_TOKEN:
     logger.info("MCP server mounted at /mcp (static bearer token)")
 elif _ENABLE_MCP and not _MCP_TOKEN:
     logger.warning("ENABLE_MCP 已开但未设 MCP_TOKEN → MCP 未启用。请设置 MCP_TOKEN 环境变量。")
+
+# ---------- 全站访问控制（可选，公网部署强烈建议设置） ----------
+# [2026-08-27] 本项目默认无访客鉴权，部署到公网（Zeabur 等）后任何人都能用，
+# 且所有请求消耗的是你自己的微信登录态。两种方式可单独或同时启用：
+#   ① 登录页：设 ADMIN_USERNAME + ADMIN_PASSWORD → 浏览器访问先跳 /signin 登录，
+#      成功后种 30 天 HttpOnly Cookie，之后正常使用（API_TOKEN 未设时 Cookie 密钥
+#      由账号密码派生，改密码即全员踢下线）
+#   ② API_TOKEN：脚本 / RSS 阅读器用，Authorization: Bearer <API_TOKEN>
+#      或 URL 加 ?token=<API_TOKEN>（浏览器带 token 访问一次也会种 Cookie）
+# 豁免：/api/health（部署平台健康检查）、/signin 与 /api/auth/login（登录本身）、
+# /mcp（有自己的 MCP_TOKEN 网关）。都不设则完全不启用，保持原行为。
+import hashlib
+import hmac as _hmac
+
+_API_TOKEN = os.getenv("API_TOKEN", "")
+_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+_LOGIN_ENABLED = bool(_ADMIN_USERNAME and _ADMIN_PASSWORD)
+# Cookie 密钥：优先用 API_TOKEN；没配则由账号密码派生（改密码 → 密钥变 → 旧 Cookie 全失效）
+_SITE_SECRET = _API_TOKEN or (
+    hashlib.sha256(f"{_ADMIN_USERNAME}:{_ADMIN_PASSWORD}".encode()).hexdigest()
+    if _LOGIN_ENABLED else ""
+)
+_SITE_COOKIE = "site_token"
+
+if _SITE_SECRET:
+    from urllib.parse import parse_qsl, urlencode
+
+    _API_BEARER = f"Bearer {_API_TOKEN}".encode() if _API_TOKEN else b""
+    _GATE_EXEMPT_PREFIXES = ("/mcp",)                          # MCP 有自己的 MCP_TOKEN 网关
+    _GATE_EXEMPT_PATHS = ("/api/health", "/signin", "/api/auth/login")
+
+    class _SiteGateMiddleware:
+        """全站网关：登录 Cookie / Bearer / ?token= 三选一鉴权；
+        浏览器页面未登录 302 去 /signin，API 请求未登录 401。"""
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http":
+                await self.app(scope, receive, send)
+                return
+            path = scope.get("path", "")
+            if path in _GATE_EXEMPT_PATHS or path.startswith(_GATE_EXEMPT_PREFIXES):
+                await self.app(scope, receive, send)
+                return
+
+            headers = dict(scope.get("headers") or [])
+
+            # Bearer（API_TOKEN 配了才校验）
+            if _API_BEARER and headers.get(b"authorization", b"") == _API_BEARER:
+                await self.app(scope, receive, send)
+                return
+
+            # 登录 Cookie
+            cookie_header = headers.get(b"cookie", b"").decode(errors="ignore")
+            cookies = dict(c.strip().split("=", 1) for c in cookie_header.split(";") if "=" in c)
+            if _hmac.compare_digest(cookies.get(_SITE_COOKIE, ""), _SITE_SECRET):
+                await self.app(scope, receive, send)
+                return
+
+            # ?token=（API_TOKEN 配了才校验）→ 种 Cookie + 302 跳转到去掉 token 的 URL
+            if _API_TOKEN:
+                pairs = parse_qsl(scope.get("query_string", b"").decode(errors="ignore"),
+                                  keep_blank_values=True)
+                if any(k == "token" and _hmac.compare_digest(v, _API_TOKEN) for k, v in pairs):
+                    clean_qs = urlencode([(k, v) for k, v in pairs if k != "token"])
+                    location = path + (f"?{clean_qs}" if clean_qs else "")
+                    await send({"type": "http.response.start", "status": 302, "headers": [
+                        (b"location", location.encode()),
+                        (b"set-cookie", _make_cookie(scope, _SITE_SECRET)),
+                    ]})
+                    await send({"type": "http.response.body", "body": b""})
+                    return
+
+            # 浏览器访问页面（非 API、Accept 含 text/html）且登录页已启用 → 302 去登录
+            accept = headers.get(b"accept", b"")
+            if (_LOGIN_ENABLED and not path.startswith("/api")
+                    and b"text/html" in accept):
+                await send({"type": "http.response.start", "status": 302, "headers": [
+                    (b"location", f"/signin?next={path}".encode()),
+                ]})
+                await send({"type": "http.response.body", "body": b""})
+                return
+
+            await send({"type": "http.response.start", "status": 401, "headers": [
+                (b"content-type", b"application/json; charset=utf-8"),
+                (b"www-authenticate", b'Bearer realm="site"'),
+            ]})
+            await send({"type": "http.response.body", "body":
+                '{"error":"unauthorized","detail":"未登录：请访问 /signin 登录，或用 Authorization: Bearer <API_TOKEN>"}'
+                .encode()})
+            return
+
+    def _make_cookie(scope, secret: str) -> bytes:
+        secure = "; Secure" if scope.get("scheme") == "https" else ""
+        return (f"{_SITE_COOKIE}={secret}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{secure}"
+                .encode())
+
+    app.add_middleware(_SiteGateMiddleware)
+    logger.info(f"全站访问控制已启用（登录页={'开' if _LOGIN_ENABLED else '关'}, API_TOKEN={'开' if _API_TOKEN else '关'}）")
+
+    @app.post("/api/auth/login", include_in_schema=False)
+    async def site_auth_login(request: Request):
+        """登录页提交账号密码 → 校验环境变量 → 种 Cookie。"""
+        if not _LOGIN_ENABLED:
+            return JSONResponse({"ok": False, "detail": "未配置 ADMIN_USERNAME/ADMIN_PASSWORD"}, 400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "detail": "请求格式错误"}, 400)
+        ok = (_hmac.compare_digest(str(body.get("username", "")), _ADMIN_USERNAME)
+              and _hmac.compare_digest(str(body.get("password", "")), _ADMIN_PASSWORD))
+        if not ok:
+            return JSONResponse({"ok": False, "detail": "账号或密码错误"}, 401)
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(_SITE_COOKIE, _SITE_SECRET, path="/", httponly=True,
+                        samesite="lax", max_age=2592000,
+                        secure=request.url.scheme == "https")
+        return resp
+
+    @app.get("/signin", include_in_schema=False)
+    async def signin_page():
+        """全站登录页（区别于 /login.html 的微信扫码登录）。"""
+        return FileResponse(static_dir / "signin.html")
 
 # 静态文件
 static_dir = Path(__file__).parent / "static"
